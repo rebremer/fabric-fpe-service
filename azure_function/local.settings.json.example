@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "PYTHON_THREADPOOL_THREAD_COUNT": "1",
+    "FUNCTIONS_WORKER_PROCESS_COUNT": "4",
+
+    "// FPE_KEY/TWEAK": "In Azure, set these as Key Vault references:",
+    "// example": "@Microsoft.KeyVault(SecretUri=https://test-lakehouse-kv.vault.azure.net/secrets/fpekey/)",
+    "FPE_KEY": "EF4359D8D580AA4F7F036D6F04FC6A94",
+    "FPE_TWEAK": "D8E7920AFA330A",
+    "FPE_MAX_BATCH_SIZE": "10000"
+  }
+}

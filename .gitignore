@@ -1,0 +1,4 @@
+azure_function/.python_packages/
+azure_function/local.settings.json
+*.pyc
+__pycache__/

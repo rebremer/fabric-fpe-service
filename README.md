@@ -100,3 +100,83 @@ bremersons@hotmail.com => l-YLt53VGs@VDIdÃ§Q4.com
 ### 4. (Optional) Create Synapse pipeline ingested and propagating data to Azure SQL
 
 Pipeline can be found in  ```Synapse/synapse_pipeline.json```
+
+
+---
+
+## FPE-as-a-Service (Azure Function) — Fabric variant
+
+The notebooks under `Synapse/` and `Fabric/` perform FPE *inside* the Spark cluster, which means the FF3 key/tweak material has to be loaded into every executor (typically pulled from Key Vault on session start). This second variant moves the FPE computation into an **Azure Function App** so that **no key material ever lives on the Spark cluster** — the cluster only holds an HTTP function key.
+
+```
+ Fabric Spark cluster                Azure Function App                  Azure Key Vault
+ +----------------------+  HTTPS    +--------------------+   reads at   +------------------+
+ ¦ pandas_udf (Arrow)   ¦ --------? ¦  POST /api/fpe     ¦  cold start  ¦  fpekey          ¦
+ ¦ pooled requests.Sess ¦           ¦  FF3 batch encrypt ¦ -----------? ¦  fpetweak        ¦
+ ¦ NO key, NO tweak     ¦ ?-------- ¦                    ¦              ¦                  ¦
+ +----------------------+  JSON     +--------------------+              +------------------+
+```
+
+### Layout
+
+| Path | Purpose |
+|---|---|
+| `azure_function/function_app.py`     | Python v2 Functions app. Single endpoint `POST /api/fpe`. Batched FF3 with deterministic alphabets per type. |
+| `azure_function/requirements.txt`    | `azure-functions`, `ff3==1.0.3`, `pycryptodome==3.23.0`, `unidecode>=1.3` |
+| `azure_function/host.json`           | Functions host config (extension bundle 4.x). |
+| `deployment/deployment.ps1`          | End-to-end PowerShell script: RG, VNet + delegated subnet, storage account with shared keys disabled, Private Endpoints (blob/queue/table) + Private DNS, Flex Consumption Function App with system-assigned MI + identity-based `AzureWebJobsStorage`, app settings, publish, lock-down. |
+| `notebooks/mask_data_fpe_ff3.ipynb`  | Fabric notebook that calls the function via a batched `pandas_udf` and scales a 1k-row seed dataset to 1M rows for a perf test. |
+
+### Why batching matters
+
+A naïve per-row Python `udf` for 1M rows × 7 PII columns would issue **7,000,000** HTTP calls. The notebook uses a scalar `pandas_udf` so each Spark task receives an Arrow micro-batch (default 10k, tuned to 5k):
+
+| Pattern                                    | HTTP calls (1M × 7) |
+|--------------------------------------------|----------------------|
+| Per-row `udf`                              | 7,000,000            |
+| `pandas_udf`, batch = 5,000                | **1,400** total      |
+
+Per-task throughput is preserved by a pooled `requests.Session` (`HTTPAdapter(pool_maxsize=32)`) with retry + back-off honouring `Retry-After`.
+
+### Supported FPE types (request body `type`)
+
+`numeric`, `alphanumeric`, `alphanumeric_extended`, `phone`, `email`, `ascii_preserve_other`. Format is preserved per type (e.g. `@` and `.` in emails, `+`/`(`/`)`/`-`/space in phone numbers, case in names).
+
+### Deploy
+
+```powershell
+# 1. Edit deployment/deployment.ps1 to set $rg/$loc/$stor/$func names, then run end-to-end.
+.\deployment\deployment.ps1
+```
+
+The script provisions a Flex Consumption Function App with system-assigned managed identity, identity-based `AzureWebJobsStorage`, Private Endpoints to storage, generates a 32-byte FPE_KEY + 7-byte FPE_TWEAK locally and stores them as plain app settings (PoC). For production, swap them to `@Microsoft.KeyVault(...)` references and grant the Function App MI `Key Vault Secrets User`.
+
+#### Build note: WSL / Linux Python 3.11
+
+Flex Consumption requires Linux Python 3.11 wheels. Building on Windows ships Windows wheels and the host fails to load them. From WSL Ubuntu (deadsnakes PPA for Python 3.11):
+
+```bash
+cd azure_function
+rm -rf .python_packages
+python3.11 -m pip install --target=.python_packages/lib/site-packages -r requirements.txt
+func azure functionapp publish <func-app-name> --python --no-build
+```
+
+`AzureWebJobsFeatureFlags=EnableWorkerIndexing` is **required** for the Python v2 (`@app.route`) decorator model — without it the host indexes 0 functions.
+
+### Smoke test
+
+```powershell
+$key = az functionapp keys list -g <rg> -n <func> --query "functionKeys.default" -o tsv
+Invoke-RestMethod -Method Post `
+  -Uri "https://<func>.azurewebsites.net/api/fpe" `
+  -Headers @{ "x-functions-key" = $key; "Content-Type" = "application/json" } `
+  -Body '{"type":"numeric","values":["12345232","00009999",null,"42"]}'
+```
+
+### Hardening checklist
+
+- FPE key/tweak only ever exist in the Function process (sourced from Key Vault references in production); never on the Spark cluster.
+- Function key is the only secret on the cluster — rotate independently of the FPE key.
+- Storage account: shared keys disabled, public access disabled after deploy, blob/queue/table reached via Private Endpoints from the delegated `Microsoft.App/environments` subnet.
+- `FPE_MAX_BATCH_SIZE` bounds per-request CPU/memory; 429s back-pressure Spark via the Retry adapter's `Retry-After` handling.
